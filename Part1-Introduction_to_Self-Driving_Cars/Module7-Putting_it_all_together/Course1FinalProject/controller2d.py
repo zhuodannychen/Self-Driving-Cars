@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 
+# .\CarlaUE4.exe /Game/Maps/RaceTrack -windowed -carla-server -benchmark -fps=30
+
 """
 2D Controller Class to be used for the CARLA waypoint follower demo.
 """
 
 import numpy as np
 import cutils
-from sympy import integrate
 import math
 
-Kp = 2.0        #speed proportional gain
-Ki = 0.05       
-Kd = 0.01
-
-k = 0.1         #look forward gain
-Lfc = 1.0       #look-ahead distance
-L = 2.9
 
 class Controller2D(object):
     def __init__(self, waypoints):
@@ -113,23 +107,22 @@ class Controller2D(object):
             to create a persistent variable (not destroyed at each iteration).
             This means that the value can be stored for use in the next
             iteration of the control loop.
-
             Example: Creation of 'v_previous', default value to be 0
             self.vars.create_var('v_previous', 0.0)
-
             Example: Setting 'v_previous' to be 1.0
             self.vars.v_previous = 1.0
-
             Example: Accessing the value from 'v_previous' to be used
             throttle_output = 0.5 * self.vars.v_previous
         """
         self.vars.create_var('v_previous', 0.0)
+        self.vars.create_var('t_previous', 0.0)
+        self.vars.create_var('error_previous', 0.0)
+        self.vars.create_var('integral_error_previous', 0.0)
 
         # Skip the first frame to store previous values properly
         if self._start_control_loop:
             """
                 Controller iteration code block.
-
                 Controller Feedback Variables:
                     x               : Current X position (meters)
                     y               : Current Y position (meters)
@@ -149,7 +142,6 @@ class Controller2D(object):
                                       Example:
                                           waypoints[2][1]: 
                                           Returns the 3rd waypoint's y position
-
                                           waypoints[5]:
                                           Returns [x5, y5, v5] (6th waypoint)
                 
@@ -173,9 +165,23 @@ class Controller2D(object):
             # Change these outputs with the longitudinal controller. Note that
             # brake_output is optional and is not required to pass the
             # assignment, as the car will naturally slow down over time.
-            a = Kp * (v_desired - v)
 
-            throttle_output = a * t + throttle_output
+            # PID control
+            # Constants
+            KP = 3
+            KI = 0.05
+            KD = 0.01
+            # time diff
+            dt = t - self.vars.t_previous
+
+            p_err = v_desired - v  # P
+            i_err = dt * p_err + self.vars.integral_error_previous  # I
+            d_err = (p_err - self.vars.error_previous) / dt  # D
+
+            acceleration = KP*p_err + KI*i_err + KD*d_err
+
+            # vf = vi + at
+            throttle_output = throttle_output + acceleration * t
             brake_output    = 0
 
             ######################################################
@@ -188,28 +194,84 @@ class Controller2D(object):
                 access the persistent variables declared above here. For
                 example, can treat self.vars.v_previous like a "global variable".
             """
-            
+
             # Change the steer output with the lateral controller. 
+            # Stanley Method
+
+            steer_output = 0
+
+            k_e = 0.5
+            # ax + by + c = 0
+            slope = (waypoints[-1][1]-waypoints[0][1]) / (waypoints[-1][0]-waypoints[0][0])
+            a = -slope
+            b = 1
+            c = slope*waypoints[0][0] - waypoints[0][1]
+
+            # heading error
+            yaw_ref = np.arctan2(waypoints[-1][1] - waypoints[0][1], waypoints[-1][0] - waypoints[0][0])
+            yaw_diff_heading = yaw_ref - yaw 
+
+            # keep it -pi to pi
+            if yaw_diff_heading > np.pi:
+                yaw_diff_heading -= 2 * np.pi
+            if yaw_diff_heading < -np.pi:
+                yaw_diff_heading += 2 * np.pi
+            
+            # crosstrack error
+            curr_xy = np.array([x, y])
+            crosstrack_error = np.min(np.sum((curr_xy - np.array(waypoints)[:, :2])**2, axis=1))
+            yaw_cross_track = np.arctan2(y - waypoints[0][1], x - waypoints[0][0])
+            yaw_center_path = yaw_ref - yaw_cross_track
+            if yaw_center_path > np.pi:
+                yaw_center_path -= 2 * np.pi
+            if yaw_center_path < -np.pi:
+                yaw_center_path += 2 * np.pi
+            if yaw_center_path > 0:
+                crosstrack_error = abs(crosstrack_error)
+            else:
+                crosstrack_error = -abs(crosstrack_error)
+            yaw_diff_crosstrack = np.arctan(k_e * crosstrack_error / v)
+
+            # final = heading error + arctan(k*e / v)
+            steer_expect = yaw_diff_crosstrack + yaw_diff_heading
+            if steer_expect > np.pi:
+                steer_expect -= 2 * np.pi
+            if steer_expect < -np.pi:
+                steer_expect += 2 * np.pi
+            steer_expect = min(1.22, steer_expect)
+            steer_expect = max(-1.22, steer_expect)
+
+            print(waypoints)
+            steer_output = steer_expect
+            """
             # pure pursuit method
             # search nearest point index   
+
+            # Constant
+            
+            k = 0.1         #look forward gain
+            Lfc = 1.0       #look-ahead distance
+            L = 2.9
+
             length = np.arange(0,100,1)
             dx = [self._current_x - waypoints[icx][0] for icx in length]
             dy = [self._current_y - waypoints[icy][1] for icy in length]
             d = [abs(math.sqrt(idx ** 2 + idy ** 2)) for (idx,idy) in zip(dx,dy)]
-            ind = d.index(min(d))
-            if ind < 2:
-                tx = waypoints[ind][0]
-                ty = waypoints[ind][1]  
+            min_idx = d.index(min(d))
+
+            if min_idx < 2:
+                tx = waypoints[min_idx][0]
+                ty = waypoints[min_idx][1]  
             else:
                 tx = waypoints[-1][0]
                 ty = waypoints[-1][1]
-                # ind = len(self._current_x) - 1    
 
             alpha_hat = math.atan2(ty - y,tx - x)
-            alpha = alpha_hat - yaw
+            angle = alpha_hat - yaw
             Lf = k * v + Lfc
-            steer_output = math.atan2(2.0 * L * math.sin(alpha) / Lf,1.0)
+            steer_output = math.atan2(2.0 * L * math.sin(angle) / Lf, 1.0)
             print("steer_output = ",steer_output)
+            """
 
             ######################################################
             # SET CONTROLS OUTPUT
@@ -230,3 +292,6 @@ class Controller2D(object):
             in the next iteration)
         """
         self.vars.v_previous = v  # Store forward speed to be used in next step
+        self.vars.t_previous = t
+        self.vars.error_previous = p_err
+        self.vars.integral_error_previous = i_err
